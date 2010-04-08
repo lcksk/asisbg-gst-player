@@ -1,0 +1,240 @@
+/*
+ * main.c
+ *
+ *  Created on: Mar 7, 2010
+ *      Author: xpucmo
+ */
+
+#include <stdio.h>
+#include <gst/gst.h>
+#include <glib.h>
+
+#include "debug.h"
+
+static int bus_call(GstBus * bus, GstMessage * msg, void * data)
+{
+	GMainLoop * loop = (GMainLoop *)data;
+	switch(GST_MESSAGE_TYPE(msg)) {
+	case GST_MESSAGE_EOS:
+		g_print("End of stream\n");
+		g_main_loop_quit(loop);
+		break;
+	case GST_MESSAGE_ERROR: {
+		char * debug;
+		GError * error;
+
+		gst_message_parse_error(msg, &error, &debug);
+		free(debug);
+
+		g_printerr("Error %s\n", error->message);
+		g_error_free(error);
+
+		g_main_loop_quit(loop);
+		break; }
+    case GST_MESSAGE_NEW_CLOCK: {
+      GstClock *clock;
+
+      gst_message_parse_new_clock(msg, &clock);
+
+      g_print ("New clock: %s\n", (clock ? GST_OBJECT_NAME(clock) : "NULL"));
+      break;
+    }
+	default:
+		g_print("GST MESSAGE: %d\n", GST_MESSAGE_TYPE(msg));
+		break;
+	}
+
+	return TRUE;
+}
+
+static void on_pad_added(GstElement * element, GstPad * pad, void * data)
+{
+	GstPad * sinkpad;
+	GstElement * decoder = (GstElement *) data;
+
+	/* We can now link this pad with the vorbis-decoder sink pad */
+	g_print("Dynamic pad created, linking demuxer/decoder\n");
+	sinkpad = gst_element_get_static_pad (decoder, "sink");
+	gst_pad_link (pad, sinkpad);
+	gst_object_unref(sinkpad);
+}
+
+static inline void add_static_ghost_pad(GstElement * bin, GstElement * el, char * name)
+{
+	GstPad * pad;
+
+	pad = gst_element_get_static_pad(el, name);
+	gst_element_add_pad(bin, gst_ghost_pad_new(name, pad));
+	gst_object_unref(GST_OBJECT(pad));
+}
+
+static gboolean print_position(GstElement *pipeline)
+{
+	GstFormat fmt = GST_FORMAT_TIME;
+	gint64 pos, len;
+	if (gst_element_query_position(pipeline, &fmt, &pos) && gst_element_query_duration(pipeline, &fmt, &len)) {
+		g_print("Time: %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT "\r", GST_TIME_ARGS (pos), GST_TIME_ARGS (len));
+	}
+	/* call me again */
+	return TRUE;
+}
+
+static void seek_to_time(GstElement *pipeline, gint64 time_nanoseconds)
+{
+	if (!gst_element_seek(pipeline, 1.0, GST_FORMAT_TIME, GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, time_nanoseconds, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)) {
+		g_print("Seek failed!\n");
+	}
+}
+
+int main (int argc, char *argv[])
+{
+	GMainLoop * loop;
+
+	GstBus * bus;
+
+	GstElement * PipeLine;
+
+	GstElement * Source;
+	GstElement * Demuxer;
+	GstElement * AudioQueue0;
+	GstElement * AudioQueue1;
+	GstElement * VideoQueue0;
+	GstElement * VideoQueue1;
+	GstElement * AudioDec;
+	GstElement * VideoDec;
+//	GstElement * AudioConv;
+	GstElement * VideoConv;
+	GstElement * AudioSink;
+	GstElement * VideoSink;
+
+	GstElement * AudioBin;
+	GstElement * VideoBin;
+
+	if(argc < 2) {
+		g_printerr("Usage: %s <filename>\n", argv[0]);
+		return -1;
+	}
+
+	if(!g_file_test(argv[1], G_FILE_TEST_EXISTS)) {
+		g_printerr("File %s does not exist\n", argv[1]);
+		return -1;
+	}
+
+	gst_init (&argc, &argv);
+
+	loop = g_main_loop_new (NULL, FALSE);
+
+	// create pipeline
+	PipeLine = gst_pipeline_new("MediaStream");
+	AudioBin = gst_bin_new("audio_bin");
+	VideoBin = gst_bin_new("video_bin");
+
+	Source = gst_element_factory_make("filesrc", "source");
+	Demuxer = gst_element_factory_make("avidemux", "avi_demuxer");
+	AudioQueue0 = gst_element_factory_make("queue", "audio_queue0");
+	AudioQueue1 = gst_element_factory_make("queue", "audio_queue1");
+	VideoQueue0 = gst_element_factory_make("queue", "video_queue0");
+	VideoQueue1 = gst_element_factory_make("queue", "video_queue1");
+	AudioDec = gst_element_factory_make("mad", "audio_decoder");
+	VideoDec = gst_element_factory_make("mfw_vpudecoder", "video_decoder"); // ffdec_mpeg4
+//	AudioConv = gst_element_factory_make("audioamplify", "audio_convertor");
+	VideoConv = gst_element_factory_make("textoverlay", "video_convertor");
+	AudioSink = gst_element_factory_make("alsasink", "audio_sink");
+	VideoSink = gst_element_factory_make("mfw_v4lsink", "video_sink"); // xvimagesink
+
+	if(!(PipeLine && Source && Demuxer && AudioQueue0 && AudioQueue1 && AudioDec && /*AudioConv &&*/ AudioSink && VideoQueue0 && VideoQueue1 && VideoDec && /*VideoConv &&*/ VideoSink)) {
+		g_printerr("One element could not be created. Exiting.\n");
+		return -1;
+	}
+
+enum MfwGstVpuDecCodecs {
+	std_mpeg4,
+	std_h263,
+	std_avc,
+};
+	// set the elements
+D(10)	g_object_set(G_OBJECT(Source), "location", argv[1], NULL);
+//D(11)	g_object_set(G_OBJECT(AudioConv), "amplification", 10, NULL);
+D(120)	g_object_set(G_OBJECT(VideoQueue0), "max-size-buffers", 2, NULL);
+D(121)	g_object_set(G_OBJECT(VideoQueue0), "max-size-time", 400, NULL);
+D(122)	g_object_set(G_OBJECT(VideoQueue0), "max-size-bytes", 400, NULL);
+//D(130)	g_object_set(G_OBJECT(AudioQueue0), "max-size-buffers", 2, NULL);
+//D(131)	g_object_set(G_OBJECT(AudioQueue0), "max-size-time", 0, NULL);
+//D(132)	g_object_set(G_OBJECT(AudioQueue0), "max-size-bytes", 0, NULL);
+D(14)	g_object_set(G_OBJECT(VideoDec), "codec-type", std_mpeg4, NULL);
+//D(15)	g_object_set(G_OBJECT(VideoConv), "text", "Asis-BG", NULL);
+D(160)	g_object_set(G_OBJECT(VideoSink), "disp-width", 800, "disp-height", 480, NULL);
+D(161)	g_object_set(G_OBJECT(VideoSink), "sync", FALSE, NULL);
+D(17)	g_object_set(G_OBJECT(AudioSink), "sync", FALSE, NULL);
+D(2)
+	// TODO: create bins
+	//gst_bin_new();
+
+	// TODO: ADD TO BIN
+	//gst_bin_add(GST_BIN(PipeLine), ); / gst_bin_remove();
+	//gst_bin_add_many(); / gst_bin_remove_many();
+
+	// add elements to audio bin
+	gst_bin_add_many(GST_BIN(AudioBin), AudioQueue0, /*AudioDec, AudioConv,*/ AudioSink, NULL);
+	// link audio elements
+	gst_element_link_many(AudioQueue0, /*AudioDec, AudioConv,*/ AudioSink, NULL);
+	// create ghost pad of audio bin
+	add_static_ghost_pad(AudioBin, AudioQueue0, "sink");
+
+	// add elements to video bin
+	gst_bin_add_many(GST_BIN(VideoBin), VideoQueue0, VideoDec,/* VideoConv,*/ VideoSink, NULL);
+	// link video elements
+	gst_element_link_many(VideoQueue0, VideoDec,/* VideoConv,*/ VideoSink, NULL);
+	// create ghost pad of video bin
+	add_static_ghost_pad(VideoBin, VideoQueue0, "sink");
+
+	// add elements to pipeline
+	gst_bin_add_many(GST_BIN(PipeLine), Source, Demuxer, AudioBin, VideoBin, NULL);
+	// link the pipeline elements
+	gst_element_link(Source, Demuxer);
+
+	//gst_element_link_pads();
+
+	// connect signal pad-added
+	// g_signal_connect(Demuxer, "pad-added", G_CALLBACK(on_pad_added), AudioDec);
+	g_signal_connect(Demuxer, "pad-added", G_CALLBACK(on_pad_added), AudioBin);
+	g_signal_connect(Demuxer, "pad-added", G_CALLBACK(on_pad_added), VideoBin);
+
+	// add message handler
+	bus = gst_pipeline_get_bus(GST_PIPELINE(PipeLine));
+	gst_bus_add_watch(bus, bus_call, loop);
+	gst_object_unref(bus);
+
+	// gst_pipeline_auto_clock(GST_PIPELINE(PipeLine));
+
+	g_print("Now playing %s\n", argv[1]);
+
+	// set state
+	GstStateChangeReturn ret;
+	ret = gst_element_set_state(PipeLine, GST_STATE_PLAYING); // GST_STATE_NULL, GST_STATE_READY, GST_STATE_PAUSED, GST_STATE_PLAYING
+	g_print("state change result: %d\n", ret);
+
+	seek_to_time(PipeLine, 10000);
+
+	// iterate
+	g_print("Running...\n");
+	g_timeout_add(200, (GSourceFunc) print_position, PipeLine);
+	g_main_loop_run(loop);
+
+	// gst_element_query()
+	// gst_element_query_position()
+	// gst_element_query_duration()
+
+	// Out of the main loop, clean up nicely
+	g_print("Returned, stopping playback\n");
+	gst_element_set_state (PipeLine, GST_STATE_NULL);
+
+	g_main_loop_quit(loop);
+	g_main_loop_unref(loop);
+
+	//unref pipeline
+	g_print("Deleting pipeline\n");
+	gst_object_unref (GST_OBJECT (PipeLine));
+
+	return 0;
+}
